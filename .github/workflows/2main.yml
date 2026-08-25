@@ -1,0 +1,224 @@
+set -euo pipefail
+
+echo "==> Removing broken workflow..."
+rm -f .github/workflows/main.yml
+
+mkdir -p .github/workflows
+
+echo "==> Creating clean GitHub Actions workflow..."
+
+cat > .github/workflows/main.yml <<'EOF'
+name: HOPE CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hope-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Syntax check
+        working-directory: backend
+        run: |
+          find . -type f -name '*.js' \
+            -not -path './node_modules/*' \
+            -print0 |
+          xargs -0 -n1 node --check
+
+      - name: Run tests
+        working-directory: backend
+        run: npm test
+
+  flutter:
+    name: Flutter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+  android:
+    name: Android Debug APK
+    runs-on: ubuntu-latest
+    needs:
+      - backend
+      - flutter
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Fix Gradle permission
+        run: chmod +x android/gradlew
+
+      - name: Build Debug APK
+        run: flutter build apk --debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hope-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
+
+  static-audit:
+    name: Static Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Fix script permissions
+        run: |
+          chmod +x tools/static_audit.sh 2>/dev/null || true
+          chmod +x backend/scripts/*.sh 2>/dev/null || true
+          chmod +x android/gradlew 2>/dev/null || true
+
+      - name: Run static audit
+        run: |
+          if [ -f tools/static_audit.sh ]; then
+            ./tools/static_audit.sh
+          else
+            echo "No static audit script found; skipping."
+          fi
+EOF
+
+echo "==> Normalizing line endings..."
+sed -i 's/\r$//' .github/workflows/main.yml
+
+echo "==> Removing UTF-8 BOM if present..."
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path(".github/workflows/main.yml")
+data = p.read_bytes()
+
+if data.startswith(b"\xef\xbb\xbf"):
+    data = data[3:]
+
+p.write_bytes(data)
+PY
+
+echo "==> Showing workflow..."
+nl -ba .github/workflows/main.yml
+
+echo "==> Checking required files..."
+
+test -f .github/workflows/main.yml
+test -f backend/package.json
+test -f backend/package-lock.json
+test -f pubspec.yaml
+test -f android/gradlew
+
+echo "==> Checking YAML syntax..."
+
+if command -v ruby >/dev/null 2>&1; then
+  ruby -e 'require "yaml"; YAML.load_file(".github/workflows/main.yml"); puts "YAML OK"'
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - <<'PY'
+from pathlib import Path
+try:
+    import yaml
+except ImportError:
+    print("PyYAML not installed; structural checks passed.")
+else:
+    yaml.safe_load(Path(".github/workflows/main.yml").read_text())
+    print("YAML OK")
+PY
+else
+  echo "No YAML parser installed; structural checks passed."
+fi
+
+echo "==> Git diff check..."
+git diff --check
+
+echo "==> Git status..."
+git status --short
+
+echo "==> Committing..."
+git add .github/workflows/main.yml
+git commit -m "ci: replace broken GitHub Actions workflow" || true
+
+echo "==> Pushing main..."
+git push origin main
+
+echo
+echo "=========================================="
+echo "HOPE CI WORKFLOW REPLACED SUCCESSFULLY"
+echo "=========================================="
+echo
+echo "Open GitHub Actions and wait for the new run."
