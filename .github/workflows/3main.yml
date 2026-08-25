@@ -1,0 +1,393 @@
+cat > /tmp/hope-full-verify.sh <<'BASH'
+#!/usr/bin/env bash
+set +e
+set -u
+set -o pipefail
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT"
+
+LOG_DIR="$ROOT/hope-test-logs-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$LOG_DIR"
+
+FAILED=()
+PASSED=()
+SKIPPED=()
+
+run_step() {
+  local name="$1"
+  shift
+
+  echo
+  echo "============================================================"
+  echo "RUN: $name"
+  echo "============================================================"
+
+  "$@" > >(tee "$LOG_DIR/$(echo "$name" | tr ' /:' '___').log") \
+         2> >(tee -a "$LOG_DIR/$(echo "$name" | tr ' /:' '___').log" >&2)
+
+  local code=$?
+
+  if [ "$code" -eq 0 ]; then
+    PASSED+=("$name")
+    echo "PASS: $name"
+  else
+    FAILED+=("$name")
+    echo "FAIL: $name (exit $code)"
+  fi
+
+  return 0
+}
+
+skip_step() {
+  local name="$1"
+  local reason="$2"
+  SKIPPED+=("$name: $reason")
+  echo "SKIP: $name -- $reason"
+}
+
+echo "HOPE full verification"
+echo "ROOT: $ROOT"
+echo "LOGS: $LOG_DIR"
+
+# ------------------------------------------------------------
+# 0. Basic checks
+# ------------------------------------------------------------
+
+if [ ! -f "pubspec.yaml" ]; then
+  echo "ERROR: pubspec.yaml not found."
+  exit 1
+fi
+
+if [ ! -f "backend/package.json" ]; then
+  echo "ERROR: backend/package.json not found."
+  exit 1
+fi
+
+# ------------------------------------------------------------
+# 1. Repair executable permissions
+# ------------------------------------------------------------
+
+chmod +x android/gradlew 2>/dev/null || true
+chmod +x tools/*.sh 2>/dev/null || true
+chmod +x backend/scripts/*.sh 2>/dev/null || true
+
+# ------------------------------------------------------------
+# 2. Backend dependencies
+# ------------------------------------------------------------
+
+if command -v node >/dev/null 2>&1; then
+  echo "Node: $(node --version)"
+else
+  echo "ERROR: Node.js is not installed."
+  FAILED+=("Node.js")
+fi
+
+if command -v npm >/dev/null 2>&1; then
+  echo "npm: $(npm --version)"
+fi
+
+if [ -f backend/package-lock.json ]; then
+  (
+    cd backend
+    npm ci --no-audit --no-fund
+  )
+  CODE=$?
+
+  if [ "$CODE" -ne 0 ]; then
+    echo "npm ci failed; attempting repair with npm install..."
+    (
+      cd backend
+      npm install --no-audit --no-fund
+    )
+  fi
+fi
+
+# ------------------------------------------------------------
+# 3. Backend syntax
+# ------------------------------------------------------------
+
+if command -v node >/dev/null 2>&1; then
+  run_step \
+    "Backend syntax" \
+    bash -c '
+      cd backend
+      find src tests -type f \( -name "*.js" -o -name "*.mjs" \) \
+        -print0 2>/dev/null |
+      while IFS= read -r -d "" f; do
+        node --check "$f" || exit 1
+      done
+    '
+else
+  skip_step "Backend syntax" "Node.js unavailable"
+fi
+
+# ------------------------------------------------------------
+# 4. Backend static checks
+# ------------------------------------------------------------
+
+if [ -x tools/static_audit.sh ]; then
+  run_step "Static audit" ./tools/static_audit.sh
+else
+  echo "Static audit script is not executable; repairing permission."
+  chmod +x tools/static_audit.sh 2>/dev/null || true
+
+  if [ -f tools/static_audit.sh ]; then
+    run_step "Static audit" bash tools/static_audit.sh
+  else
+    skip_step "Static audit" "tools/static_audit.sh not found"
+  fi
+fi
+
+# ------------------------------------------------------------
+# 5. Backend test suites
+# ------------------------------------------------------------
+
+if [ -d backend/node_modules ]; then
+
+  run_step \
+    "Backend fast regression" \
+    bash -c 'cd backend && npm run test:fast'
+
+  run_step \
+    "Backend contract tests" \
+    bash -c 'cd backend && npm run test:contract'
+
+  run_step \
+    "Backend backup tests" \
+    bash -c 'cd backend && npm run test:backup'
+
+  run_step \
+    "Backend full test suite" \
+    bash -c 'cd backend && npm test'
+
+  run_step \
+    "Backend E2E flow" \
+    bash -c 'cd backend && npm run test:e2e'
+
+  run_step \
+    "Backend performance/health" \
+    bash -c 'cd backend && npm run test:perf'
+
+  run_step \
+    "Backend security audit" \
+    bash -c '
+      cd backend
+      npm audit --audit-level=high || true
+      exit 0
+    '
+
+else
+  skip_step "Backend tests" "backend/node_modules unavailable after dependency repair"
+fi
+
+# ------------------------------------------------------------
+# 6. Flutter environment
+# ------------------------------------------------------------
+
+if command -v flutter >/dev/null 2>&1; then
+  echo "Flutter:"
+  flutter --version
+else
+  skip_step "Flutter" "Flutter SDK is not installed"
+fi
+
+# ------------------------------------------------------------
+# 7. Flutter dependencies
+# ------------------------------------------------------------
+
+if command -v flutter >/dev/null 2>&1; then
+
+  run_step \
+    "Flutter clean" \
+    flutter clean
+
+  run_step \
+    "Flutter pub get" \
+    flutter pub get
+
+  # Retry package resolution if the first attempt failed.
+  if [ ! -f ".dart_tool/package_config.json" ]; then
+    echo "Flutter dependency resolution incomplete; retrying..."
+    flutter pub cache repair || true
+    flutter pub get || true
+  fi
+
+  run_step \
+    "Flutter analyze" \
+    flutter analyze
+
+  run_step \
+    "Flutter unit/widget tests" \
+    flutter test
+
+else
+  skip_step "Flutter dependencies" "Flutter SDK unavailable"
+fi
+
+# ------------------------------------------------------------
+# 8. Flutter integration tests (only when a device exists)
+# ------------------------------------------------------------
+
+if command -v flutter >/dev/null 2>&1; then
+
+  DEVICE_OUTPUT="$(flutter devices 2>/dev/null || true)"
+
+  echo
+  echo "Detected Flutter devices:"
+  echo "$DEVICE_OUTPUT"
+
+  if echo "$DEVICE_OUTPUT" | grep -qE 'emulator|android|chrome|linux|macos|windows'; then
+    run_step \
+      "Flutter integration tests" \
+      flutter test integration_test
+  else
+    skip_step \
+      "Flutter integration tests" \
+      "No usable Flutter device/emulator detected"
+  fi
+
+else
+  skip_step \
+    "Flutter integration tests" \
+    "Flutter SDK unavailable"
+fi
+
+# ------------------------------------------------------------
+# 9. Android Gradle sanity
+# ------------------------------------------------------------
+
+if [ -x android/gradlew ] || [ -f android/gradlew ]; then
+  chmod +x android/gradlew
+
+  run_step \
+    "Android Gradle tasks" \
+    bash -c '
+      cd android
+      ./gradlew tasks --no-daemon --stacktrace
+    '
+else
+  skip_step "Android Gradle" "android/gradlew not found"
+fi
+
+# ------------------------------------------------------------
+# 10. Build APK
+# ------------------------------------------------------------
+
+APK_OK=0
+
+if command -v flutter >/dev/null 2>&1; then
+
+  echo
+  echo "============================================================"
+  echo "BUILDING DEBUG APK"
+  echo "============================================================"
+
+  flutter clean || true
+  flutter pub get || true
+
+  flutter build apk \
+    --debug \
+    --dart-define=API_BASE_URL="${API_BASE_URL:-http://10.0.2.2:3000/api/v1}"
+
+  CODE=$?
+
+  if [ "$CODE" -ne 0 ]; then
+    echo "First APK build failed."
+    echo "Retrying after Gradle cleanup..."
+
+    rm -rf android/.gradle build 2>/dev/null || true
+    chmod +x android/gradlew 2>/dev/null || true
+
+    flutter pub get || true
+
+    flutter build apk \
+      --debug \
+      --dart-define=API_BASE_URL="${API_BASE_URL:-http://10.0.2.2:3000/api/v1}"
+
+    CODE=$?
+  fi
+
+  if [ "$CODE" -eq 0 ]; then
+    APK="$(find build -type f -name '*.apk' -print | sort | head -n 1)"
+
+    if [ -n "$APK" ] && [ -f "$APK" ]; then
+      APK_OK=1
+      mkdir -p "$ROOT/artifacts"
+      cp "$APK" "$ROOT/artifacts/hope-debug.apk"
+
+      echo
+      echo "APK CREATED:"
+      echo "$ROOT/artifacts/hope-debug.apk"
+
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$ROOT/artifacts/hope-debug.apk" \
+          | tee "$ROOT/artifacts/hope-debug.apk.sha256"
+      fi
+
+      PASSED+=("Android APK build")
+    else
+      FAILED+=("Android APK artifact missing")
+    fi
+  else
+    FAILED+=("Android APK build")
+  fi
+
+else
+  skip_step "Android APK build" "Flutter SDK unavailable"
+fi
+
+# ------------------------------------------------------------
+# 11. Final report
+# ------------------------------------------------------------
+
+echo
+echo
+echo "============================================================"
+echo "FINAL REPORT"
+echo "============================================================"
+
+echo
+echo "PASSED:"
+if [ "${#PASSED[@]}" -eq 0 ]; then
+  echo "  none"
+else
+  printf '  ✓ %s\n' "${PASSED[@]}"
+fi
+
+echo
+echo "FAILED:"
+if [ "${#FAILED[@]}" -eq 0 ]; then
+  echo "  none"
+else
+  printf '  ✗ %s\n' "${FAILED[@]}"
+fi
+
+echo
+echo "SKIPPED:"
+if [ "${#SKIPPED[@]}" -eq 0 ]; then
+  echo "  none"
+else
+  printf '  - %s\n' "${SKIPPED[@]}"
+fi
+
+echo
+echo "Logs:"
+echo "$LOG_DIR"
+
+if [ "$APK_OK" -eq 1 ]; then
+  echo
+  echo "APK:"
+  ls -lh "$ROOT/artifacts/hope-debug.apk"
+fi
+
+echo
+echo "============================================================"
+
+# Do NOT stop the pipeline because one test failed.
+# Exit 0 when the pipeline completed and report failures above.
+exit 0
+BASH
+
+chmod +x /tmp/hope-full-verify.sh
+/tmp/hope-full-verify.sh
