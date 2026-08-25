@@ -1,0 +1,263 @@
+- name: Persistent repair-test-build loop
+        id: persistent_loop
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        timeout-minutes: 90
+        env:
+          MAX_CYCLES: "15"
+          API_BASE_URL: ${{ env.API_BASE_URL }}
+          NDK_VERSION: ${{ env.NDK_VERSION }}
+        run: |
+          set -u
+
+          : "${API_BASE_URL:?API_BASE_URL is not set — define it in the workflow env block}"
+          : "${NDK_VERSION:?NDK_VERSION is not set — define it in the workflow env block}"
+
+          CYCLE=1
+          SUCCESS=0
+          PREV_REPAIR_HASH=""
+          PREV_FAILURE_HASH=""
+
+          mkdir -p "$GITHUB_WORKSPACE/.repair-state"
+
+          echo "Initial cleanup: ONE TIME ONLY"
+          flutter clean
+          flutter pub get
+
+          while [ "$CYCLE" -le "$MAX_CYCLES" ]; do
+
+            echo ""
+            echo "=========================================================="
+            echo "PERSISTENT REPAIR CYCLE $CYCLE / $MAX_CYCLES"
+            echo "Workspace is preserved between attempts."
+            echo "=========================================================="
+
+            git status --short \
+              > "$GITHUB_WORKSPACE/.repair-state/git-status-before.txt" \
+              2>&1 || true
+
+            git diff \
+              > "$GITHUB_WORKSPACE/.repair-state/diff-before.patch" \
+              2>&1 || true
+
+            echo "Updating dependencies without cleaning workspace..."
+            flutter pub get \
+              > "$GITHUB_WORKSPACE/.repair-state/pub-get-$CYCLE.log" \
+              2>&1
+            PUB_EXIT=$?
+
+            ANALYZE_EXIT=1
+            TEST_EXIT=1
+            DEBUG_EXIT=1
+            RELEASE_EXIT=1
+
+            if [ "$PUB_EXIT" -eq 0 ]; then
+              echo "Running analyzer..."
+              flutter analyze --no-fatal-infos \
+                > "$GITHUB_WORKSPACE/.repair-state/analyze-$CYCLE.log" \
+                2>&1
+              ANALYZE_EXIT=$?
+            else
+              echo "Skipping analyze: pub get failed."
+              echo "skipped: pub get failed" \
+                > "$GITHUB_WORKSPACE/.repair-state/analyze-$CYCLE.log"
+            fi
+
+            if [ "$ANALYZE_EXIT" -eq 0 ]; then
+              echo "Running tests..."
+              flutter test --coverage \
+                > "$GITHUB_WORKSPACE/.repair-state/test-$CYCLE.log" \
+                2>&1
+              TEST_EXIT=$?
+            else
+              echo "Skipping tests: analyze failed."
+              echo "skipped: analyze failed" \
+                > "$GITHUB_WORKSPACE/.repair-state/test-$CYCLE.log"
+            fi
+
+            if [ "$TEST_EXIT" -eq 0 ]; then
+              echo "Running debug APK build..."
+              flutter build apk \
+                --debug \
+                --dart-define=API_BASE_URL="${API_BASE_URL}" \
+                > "$GITHUB_WORKSPACE/.repair-state/build-debug-$CYCLE.log" \
+                2>&1
+              DEBUG_EXIT=$?
+            else
+              echo "Skipping debug build: tests failed."
+              echo "skipped: tests failed" \
+                > "$GITHUB_WORKSPACE/.repair-state/build-debug-$CYCLE.log"
+            fi
+
+            if [ "$DEBUG_EXIT" -eq 0 ]; then
+              echo "Running release APK build..."
+              flutter build apk \
+                --release \
+                --dart-define=API_BASE_URL="${API_BASE_URL}" \
+                > "$GITHUB_WORKSPACE/.repair-state/build-release-$CYCLE.log" \
+                2>&1
+              RELEASE_EXIT=$?
+            else
+              echo "Skipping release build: debug build failed."
+              echo "skipped: debug build failed" \
+                > "$GITHUB_WORKSPACE/.repair-state/build-release-$CYCLE.log"
+            fi
+
+            if [ "$PUB_EXIT" -eq 0 ] &&
+               [ "$ANALYZE_EXIT" -eq 0 ] &&
+               [ "$TEST_EXIT" -eq 0 ] &&
+               [ "$DEBUG_EXIT" -eq 0 ] &&
+               [ "$RELEASE_EXIT" -eq 0 ]; then
+
+              echo ""
+              echo "=========================================================="
+              echo "SUCCESS"
+              echo "All checks passed in persistent workspace."
+              echo "=========================================================="
+
+              SUCCESS=1
+              break
+            fi
+
+            echo ""
+            echo "Failure detected. Collecting diagnostics..."
+
+            {
+              echo "=== PUB GET ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/pub-get-$CYCLE.log"
+
+              echo ""
+              echo "=== ANALYZE ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/analyze-$CYCLE.log"
+
+              echo ""
+              echo "=== TEST ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/test-$CYCLE.log"
+
+              echo ""
+              echo "=== DEBUG BUILD ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/build-debug-$CYCLE.log"
+
+              echo ""
+              echo "=== RELEASE BUILD ==="
+              cat "$GITHUB_WORKSPACE/.repair-state/build-release-$CYCLE.log" 2>/dev/null || true
+            } > "$GITHUB_WORKSPACE/.repair-state/current-failure-$CYCLE.txt"
+
+            echo ""
+            echo "Preserving workspace."
+            echo "Starting repair on the CURRENT state."
+
+            dart fix --apply \
+              > "$GITHUB_WORKSPACE/.repair-state/dart-fix-$CYCLE.log" \
+              2>&1 || true
+
+            dart format lib test integration_test \
+              > "$GITHUB_WORKSPACE/.repair-state/format-$CYCLE.log" \
+              2>&1 || true
+
+            flutter pub get \
+              > "$GITHUB_WORKSPACE/.repair-state/pub-get-repair-$CYCLE.log" \
+              2>&1 || true
+
+            GRADLE_KTS="$(find android \
+              -type f \
+              -path "*/app/build.gradle.kts" \
+              | head -1 || true)"
+
+            GRADLE_GROOVY="$(find android \
+              -type f \
+              -path "*/app/build.gradle" \
+              | head -1 || true)"
+
+            if [ -n "$GRADLE_KTS" ]; then
+
+              if grep -q "ndkVersion" "$GRADLE_KTS"; then
+                sed -i \
+                  "s|ndkVersion[[:space:]]*=.*|ndkVersion = \"${NDK_VERSION}\"|" \
+                  "$GRADLE_KTS"
+              else
+                sed -i \
+                  "/android {/a\\    ndkVersion = \"${NDK_VERSION}\"" \
+                  "$GRADLE_KTS"
+              fi
+
+            elif [ -n "$GRADLE_GROOVY" ]; then
+
+              if grep -q "ndkVersion" "$GRADLE_GROOVY"; then
+                sed -i \
+                  "s|ndkVersion[[:space:]].*|ndkVersion \"${NDK_VERSION}\"|" \
+                  "$GRADLE_GROOVY"
+              else
+                sed -i \
+                  "/android {/a\\    ndkVersion \"${NDK_VERSION}\"" \
+                  "$GRADLE_GROOVY"
+              fi
+
+            fi
+
+            git status --short \
+              > "$GITHUB_WORKSPACE/.repair-state/git-status-after-repair-$CYCLE.txt" \
+              2>&1 || true
+
+            git diff \
+              > "$GITHUB_WORKSPACE/.repair-state/diff-after-repair-$CYCLE.patch" \
+              2>&1 || true
+
+            REPAIR_HASH="$(sha256sum "$GITHUB_WORKSPACE/.repair-state/diff-after-repair-$CYCLE.patch" | cut -d' ' -f1)"
+            FAILURE_HASH="$(sha256sum "$GITHUB_WORKSPACE/.repair-state/current-failure-$CYCLE.txt" | cut -d' ' -f1)"
+
+            if [ "$CYCLE" -gt 1 ] &&
+               [ "$REPAIR_HASH" = "$PREV_REPAIR_HASH" ] &&
+               [ "$FAILURE_HASH" = "$PREV_FAILURE_HASH" ]; then
+
+              echo ""
+              echo "=========================================================="
+              echo "NO PROGRESS DETECTED"
+              echo "The repair step made no changes and the failure is"
+              echo "identical to the previous cycle. Automatic repair"
+              echo "cannot fix this — it needs a manual code change."
+              echo "Stopping early instead of repeating cycles $CYCLE..$MAX_CYCLES."
+              echo "=========================================================="
+              break
+            fi
+
+            PREV_REPAIR_HASH="$REPAIR_HASH"
+            PREV_FAILURE_HASH="$FAILURE_HASH"
+
+            echo ""
+            echo "Repair complete."
+            echo "Workspace preserved."
+            echo "Moving to next cycle."
+
+            CYCLE=$((CYCLE + 1))
+
+          done
+
+          if [ "$SUCCESS" -ne 1 ]; then
+
+            echo ""
+            echo "=========================================================="
+            echo "REPAIR LIMIT REACHED OR NO FURTHER PROGRESS POSSIBLE"
+            echo "=========================================================="
+
+            echo "Last diagnostics:"
+            tail -500 \
+              "$GITHUB_WORKSPACE/.repair-state/current-failure-$CYCLE.txt" \
+              2>/dev/null || \
+            tail -500 \
+              "$GITHUB_WORKSPACE/.repair-state/current-failure-$((CYCLE-1)).txt" \
+              || true
+
+            exit 1
+          fi
+
+          echo "FINAL_SUCCESS=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload repair-state diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-state-logs
+          path: ${{ github.workspace }}/.repair-state/
+          if-no-files-found: warn
+          retention-days: 14
