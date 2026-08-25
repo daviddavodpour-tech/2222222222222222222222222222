@@ -1,0 +1,62 @@
+set -e
+
+echo '===== REPO ====='
+git remote -v
+
+echo
+echo '===== CURRENT BRANCH ====='
+git branch --show-current
+
+echo
+echo '===== WORKFLOW FILE ====='
+git show HEAD:.github/workflows/main.yml | cat -A
+
+echo
+echo '===== RAW BYTES ====='
+git show HEAD:.github/workflows/main.yml | xxd -g1 | head -20
+
+echo
+echo '===== REBUILDING CLEAN WORKFLOW ====='
+
+rm -f .github/workflows/main.yml
+mkdir -p .github/workflows
+
+printf '%s\n' \
+'name: HOPE CI' \
+'' \
+'on:' \
+'  push:' \
+'    branches: [main]' \
+'  pull_request:' \
+'    branches: [main]' \
+'' \
+'permissions:' \
+'  contents: read' \
+'' \
+'jobs:' \
+'  smoke:' \
+'    runs-on: ubuntu-latest' \
+'    steps:' \
+'      - uses: actions/checkout@v4' \
+'      - uses: actions/setup-node@v4' \
+'        with:' \
+'          node-version: 20' \
+'      - run: node --version' \
+> .github/workflows/main.yml
+
+echo
+echo '===== NEW FILE ====='
+cat -A .github/workflows/main.yml
+
+echo
+echo '===== CHECK ====='
+git diff --check
+
+echo
+echo '===== COMMIT ====='
+git add .github/workflows/main.yml
+git commit -m "ci: replace invalid workflow with minimal valid workflow" || true
+
+echo
+echo '===== PUSH ====='
+git push origin main
